@@ -14,8 +14,9 @@ Config :
 
 import os
 import math
+import json
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Any
 
 import pandas as pd
 import streamlit as st
@@ -70,16 +71,15 @@ def parse_keyword_list(raw_text: str) -> List[str]:
     """Nettoie et déduplique une liste collée (1 mot-clé par ligne)."""
     if not raw_text:
         return []
-    # Sépare sur retour ligne ; tolère les ‘;’ et ‘,’ résiduels en fin/ligne.
     lines = [l.strip(" \t,;") for l in raw_text.splitlines()]
     kws = [l for l in lines if l]
-    # Déduplique en conservant l’ordre
     seen = set()
     out = []
     for k in kws:
         knorm = k.strip()
-        if knorm and knorm.lower() not in seen:
-            seen.add(knorm.lower())
+        key = knorm.lower()
+        if knorm and key not in seen:
+            seen.add(key)
             out.append(knorm)
     return out
 
@@ -100,7 +100,7 @@ def export_xlsx(df_detail: pd.DataFrame, out_dir: Path, basename: str = "cluster
         df_detail.to_excel(writer, index=False, sheet_name="Detailed")
         summary = build_summary(df_detail)
         summary.to_excel(writer, index=False, sheet_name="Summary")
-        # Ajustement largeurs simple
+        # Ajustement simple des largeurs
         for sheet_name, df in {"Detailed": df_detail, "Summary": summary}.items():
             ws = writer.sheets[sheet_name]
             for i, col in enumerate(df.columns, 1):
@@ -109,7 +109,7 @@ def export_xlsx(df_detail: pd.DataFrame, out_dir: Path, basename: str = "cluster
     return str(path)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# OpenAI client + schémas de sortie structurée
+# OpenAI client + helpers Structured Outputs
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _client() -> OpenAI:
@@ -172,8 +172,31 @@ def _structured_batch_schema(allowed: List[str]) -> dict:
         "strict": True
     }
 
+def _safe_output_json(resp) -> Any:
+    """
+    Essaie d'extraire un JSON structuré depuis la réponse Responses API.
+    Préfère resp.output_json ; fallback sur output_text -> json.loads si nécessaire.
+    """
+    try:
+        return resp.output_json
+    except Exception:
+        pass
+    try:
+        # Certaines versions exposent du texte JSON brut
+        txt = getattr(resp, "output_text", None)
+        if txt:
+            return json.loads(txt)
+    except Exception:
+        pass
+    # Dernier recours : parser le premier bloc de texte s'il existe
+    try:
+        first = resp.output[0].content[0].text
+        return json.loads(first)
+    except Exception as e:
+        raise RuntimeError(f"Impossible de parser la sortie JSON : {e}")
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Appels API (avec retry)
+# Appels API (avec retry) — CORRIGÉS pour Responses.create(input=[...])
 # ──────────────────────────────────────────────────────────────────────────────
 
 @retry(
@@ -184,8 +207,8 @@ def _structured_batch_schema(allowed: List[str]) -> dict:
 )
 def propose_categories(sample_keywords: List[str], lang: str = "fr", max_cat: int = 8, model: str = "gpt-4o-mini") -> List[Dict[str, str]]:
     client = _client()
-    sys = CATEGORY_DISCOVERY_SYS.format(max_cat=max_cat)
-    user = CATEGORY_DISCOVERY_USER.format(
+    sys_prompt = CATEGORY_DISCOVERY_SYS.format(max_cat=max_cat)
+    user_prompt = CATEGORY_DISCOVERY_USER.format(
         sample="\n".join(f"- {kw}" for kw in sample_keywords[:300]),
         max_cat=max_cat,
         lang=lang
@@ -193,12 +216,14 @@ def propose_categories(sample_keywords: List[str], lang: str = "fr", max_cat: in
     schema = _structured_categories_schema(max_cat)
     resp = client.responses.create(
         model=model,
-        temperature=0.2,
-        system=sys,
-        input=user,
+        input=[
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
         response_format={"type": "json_schema", "json_schema": schema},
+        temperature=0.2,
     )
-    data = resp.output_json
+    data = _safe_output_json(resp)
     return data["categories"]
 
 @retry(
@@ -209,9 +234,9 @@ def propose_categories(sample_keywords: List[str], lang: str = "fr", max_cat: in
 )
 def categorize_batch(keywords: List[str], allowed_categories: List[str], lang: str = "fr", model: str = "gpt-4o-mini") -> List[Dict]:
     client = _client()
-    sys = CATEGORIZATION_SYS
+    sys_prompt = CATEGORIZATION_SYS
     cat_list = "\n".join(f"- {c}" for c in allowed_categories)
-    user = CATEGORIZATION_USER.format(
+    user_prompt = CATEGORIZATION_USER.format(
         categories_list=cat_list,
         keywords_chunk="\n".join(f"- {k}" for k in keywords),
         lang=lang
@@ -219,12 +244,14 @@ def categorize_batch(keywords: List[str], allowed_categories: List[str], lang: s
     schema = _structured_batch_schema(allowed_categories)
     resp = client.responses.create(
         model=model,
-        temperature=0.1,
-        system=sys,
-        input=user,
+        input=[
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
         response_format={"type": "json_schema", "json_schema": schema},
+        temperature=0.1,
     )
-    data = resp.output_json
+    data = _safe_output_json(resp)
     return data["items"]
 
 # ──────────────────────────────────────────────────────────────────────────────
