@@ -172,31 +172,24 @@ def _structured_batch_schema(allowed: List[str]) -> dict:
         "strict": True
     }
 
-def _safe_output_json(resp) -> Any:
+def _parse_json_from_chat(content: str) -> Any:
     """
-    Essaie d'extraire un JSON structuré depuis la réponse Responses API.
-    Préfère resp.output_json ; fallback sur output_text -> json.loads si nécessaire.
+    Robustesse : certains SDK renvoient déjà une string JSON.
+    Essaie json.loads ; s'il y a du texte parasite, tente d'isoler le premier bloc {...}.
     """
     try:
-        return resp.output_json
+        return json.loads(content)
     except Exception:
         pass
-    try:
-        # Certaines versions exposent du texte JSON brut
-        txt = getattr(resp, "output_text", None)
-        if txt:
-            return json.loads(txt)
-    except Exception:
-        pass
-    # Dernier recours : parser le premier bloc de texte s'il existe
-    try:
-        first = resp.output[0].content[0].text
-        return json.loads(first)
-    except Exception as e:
-        raise RuntimeError(f"Impossible de parser la sortie JSON : {e}")
+    # Fallback : extraire un bloc JSON brut
+    start = content.find("{")
+    end = content.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return json.loads(content[start:end+1])
+    raise RuntimeError("Réponse du modèle non JSON ou mal formée.")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Appels API (avec retry) — CORRIGÉS pour Responses.create(input=[...])
+# Appels API (avec retry) — via chat.completions.create()
 # ──────────────────────────────────────────────────────────────────────────────
 
 @retry(
@@ -214,16 +207,17 @@ def propose_categories(sample_keywords: List[str], lang: str = "fr", max_cat: in
         lang=lang
     )
     schema = _structured_categories_schema(max_cat)
-    resp = client.responses.create(
+    resp = client.chat.completions.create(
         model=model,
-        input=[
+        messages=[
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        # Si votre SDK/model ne supporte pas json_schema ici, remplacez par {"type":"json_object"}
         response_format={"type": "json_schema", "json_schema": schema},
         temperature=0.2,
     )
-    data = _safe_output_json(resp)
+    data = _parse_json_from_chat(resp.choices[0].message.content)
     return data["categories"]
 
 @retry(
@@ -242,16 +236,17 @@ def categorize_batch(keywords: List[str], allowed_categories: List[str], lang: s
         lang=lang
     )
     schema = _structured_batch_schema(allowed_categories)
-    resp = client.responses.create(
+    resp = client.chat.completions.create(
         model=model,
-        input=[
+        messages=[
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        # Si besoin, fallback possible vers {"type":"json_object"}
         response_format={"type": "json_schema", "json_schema": schema},
         temperature=0.1,
     )
-    data = _safe_output_json(resp)
+    data = _parse_json_from_chat(resp.choices[0].message.content)
     return data["items"]
 
 # ──────────────────────────────────────────────────────────────────────────────
