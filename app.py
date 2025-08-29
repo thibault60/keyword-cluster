@@ -119,6 +119,7 @@ def _client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 def _structured_categories_schema(max_cat: int = 8) -> dict:
+    # ⚠️ IMPORTANT : 'required' DOIT contenir toutes les clés déclarées dans 'properties'
     return {
         "name": "CategoryProposal",
         "schema": {
@@ -136,7 +137,7 @@ def _structured_categories_schema(max_cat: int = 8) -> dict:
                             "name": {"type": "string", "minLength": 3, "maxLength": 40},
                             "description": {"type": "string", "minLength": 5, "maxLength": 240},
                         },
-                        "required": ["name"]
+                        "required": ["name", "description"]  # <- description devient obligatoire
                     }
                 }
             },
@@ -146,6 +147,7 @@ def _structured_categories_schema(max_cat: int = 8) -> dict:
     }
 
 def _structured_batch_schema(allowed: List[str]) -> dict:
+    # 'reason' reste optionnel : on garde 'required' sur les 3 champs critiques
     return {
         "name": "BatchCategorization",
         "schema": {
@@ -173,15 +175,11 @@ def _structured_batch_schema(allowed: List[str]) -> dict:
     }
 
 def _parse_json_from_chat(content: str) -> Any:
-    """
-    Robustesse : certains SDK renvoient déjà une string JSON.
-    Essaie json.loads ; s'il y a du texte parasite, tente d'isoler le premier bloc {...}.
-    """
+    """Parse robuste : tente json.loads, sinon isole le premier bloc {...}."""
     try:
         return json.loads(content)
     except Exception:
         pass
-    # Fallback : extraire un bloc JSON brut
     start = content.find("{")
     end = content.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -213,7 +211,7 @@ def propose_categories(sample_keywords: List[str], lang: str = "fr", max_cat: in
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        # Si votre SDK/model ne supporte pas json_schema ici, remplacez par {"type":"json_object"}
+        # Si votre environnement ne supporte pas json_schema ici, remplacez par {"type":"json_object"}
         response_format={"type": "json_schema", "json_schema": schema},
         temperature=0.2,
     )
@@ -242,7 +240,7 @@ def categorize_batch(keywords: List[str], allowed_categories: List[str], lang: s
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        # Si besoin, fallback possible vers {"type":"json_object"}
+        # Fallback possible : {"type":"json_object"} si besoin
         response_format={"type": "json_schema", "json_schema": schema},
         temperature=0.1,
     )
@@ -283,88 +281,4 @@ def main():
         "assurance vie unités de compte",
         "obligations court terme",
         "fonds monétaires",
-        "allocation multi-actifs",
-        "gestion passive etf",
-        "scpi rendement",
-        "plan épargne retraite entreprise",
-    ])
-    raw = st.text_area(
-        "Collez ici (copier/coller depuis Excel/Sheets fonctionne) — 1 mot-clé par ligne",
-        value=placeholder,
-        height=240
-    )
-    keywords_all = parse_keyword_list(raw)
-    st.write(f"Total de mots-clés uniques : **{len(keywords_all)}**")
-    if len(keywords_all) == 0:
-        st.info("Ajoutez au moins quelques mots-clés pour continuer.")
-        return
-
-    st.write("## 2) Définition des catégories (max 8)")
-    mode = st.radio("Choix du mode", ["Auto (proposées par l'IA)", "Manuel (je fournis la liste)"], index=0, horizontal=True)
-
-    categories: List[str] = []
-    if mode == "Auto (proposées par l'IA)":
-        sample_size = min(300, max(50, int(len(keywords_all) * 0.2)))
-        sample = keywords_all[:sample_size]
-        if st.button(f"🔍 Proposer des catégories (échantillon {sample_size})"):
-            try:
-                props = propose_categories(sample, lang=lang, max_cat=8, model=model)
-                categories = [c["name"] for c in props][:8]
-                st.session_state["categories"] = categories
-                st.success("Catégories proposées : " + ", ".join(categories))
-            except Exception as e:
-                st.error(f"Erreur proposition catégories : {e}")
-        categories = st.session_state.get("categories", [])
-    else:
-        manual_default = "Marchés & Macro, ESG & ISR, Fonds & OPCVM, ETF & Indexation, Allocation & Multi-actifs, Taux & Crédit, Épargne & Retraite, Fiscalité & Réglementation"
-        manual = st.text_input("Saisissez vos catégories (séparées par des virgules, max 8)", value=manual_default)
-        categories = [c.strip() for c in manual.split(",") if c.strip()][:8]
-
-    if categories:
-        st.success(f"Catégories retenues ({len(categories)}) : " + ", ".join(categories))
-
-    st.write("## 3) Catégorisation")
-    if categories and st.button("🚀 Lancer la catégorisation"):
-        results = []
-        total = len(keywords_all)
-        n_batches = math.ceil(total / batch_size)
-        prog = st.progress(0, text="Traitement en cours…")
-
-        for i in range(n_batches):
-            chunk = keywords_all[i * batch_size:(i + 1) * batch_size]
-            try:
-                items = categorize_batch(chunk, allowed_categories=categories, lang=lang, model=model)
-                results.extend(items)
-            except Exception as e:
-                st.error(f"Erreur lot {i+1}/{n_batches} : {e}")
-            prog.progress((i + 1) / n_batches, text=f"Lot {i+1}/{n_batches} traité")
-
-        if not results:
-            st.error("Aucun résultat.")
-            return
-
-        df_out = pd.DataFrame(results)
-        if "reason" not in df_out.columns:
-            df_out["reason"] = ""
-        df_out = df_out[["keyword", "category", "confidence", "reason"]]
-
-        st.write("### Aperçu")
-        st.dataframe(df_out.head(20), use_container_width=True)
-
-        out_path = export_xlsx(df_out, Path("exports"))
-        with open(out_path, "rb") as f:
-            st.download_button(
-                "⬇️ Télécharger l'export XLSX",
-                data=f.read(),
-                file_name=os.path.basename(out_path),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-        st.success(f"Export généré : {out_path}")
-        st.write("### Synthèse par catégorie")
-        summary = df_out.groupby("category").agg(count=("keyword", "count")).reset_index()
-        summary["share"] = (summary["count"] / summary["count"].sum()).round(3)
-        st.dataframe(summary.sort_values("count", ascending=False), use_container_width=True)
-
-if __name__ == "__main__":
-    main()
+        "allocation multi-act
