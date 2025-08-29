@@ -1,24 +1,15 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-Amundi — Clustering de mots-clés (≤ 8 catégories) en un seul fichier.
+Amundi — Clustering de mots-clés (≤ 8 catégories) – Saisie en LISTE (1 par ligne).
 Lancez : streamlit run app.py
 
 Prérequis :
   pip install openai>=1.40.0 streamlit>=1.33.0 pandas>=2.1.0 python-dotenv>=1.0.1 openpyxl>=3.1.2 tenacity>=8.2.3
 
 Config :
-  - Placez votre clé dans l'env : OPENAI_API_KEY=sk-...
-  - Ou saisissez-la dans la sidebar de l'app.
-
-Fonctions :
-  - Proposer automatiquement 5–8 catégories (éditables).
-  - Catégoriser ~1 000 mots-clés en EXACTEMENT 1 catégorie parmi ≤ 8.
-  - Export XLSX (onglets Detailed + Summary).
-
-Notes :
-  - Modèle par défaut : gpt-4o-mini.
-  - Sorties forçées via JSON Schema (Responses API -> Structured Outputs).
+  - Placez votre clé : OPENAI_API_KEY=sk-...
+  - Ou saisissez-la dans la sidebar de l’app.
 """
 
 import os
@@ -30,8 +21,6 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
-# OpenAI Python SDK v1.40+ (Responses API)
 from openai import OpenAI
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -77,12 +66,22 @@ Retourne STRICTEMENT le JSON qui respecte le schéma fourni.
 # Utilitaires
 # ──────────────────────────────────────────────────────────────────────────────
 
-def auto_detect_keyword_column(df: pd.DataFrame) -> str:
-    lower_cols = {c.lower(): c for c in df.columns}
-    for cand in ["keyword", "keywords", "motcle", "mot_clé", "mot-cle", "mots-clés", "kw", "query", "requete"]:
-        if cand in lower_cols:
-            return lower_cols[cand]
-    return df.columns[0]
+def parse_keyword_list(raw_text: str) -> List[str]:
+    """Nettoie et déduplique une liste collée (1 mot-clé par ligne)."""
+    if not raw_text:
+        return []
+    # Sépare sur retour ligne ; tolère les ‘;’ et ‘,’ résiduels en fin/ligne.
+    lines = [l.strip(" \t,;") for l in raw_text.splitlines()]
+    kws = [l for l in lines if l]
+    # Déduplique en conservant l’ordre
+    seen = set()
+    out = []
+    for k in kws:
+        knorm = k.strip()
+        if knorm and knorm.lower() not in seen:
+            seen.add(knorm.lower())
+            out.append(knorm)
+    return out
 
 def build_summary(df: pd.DataFrame, category_col: str = "category", keyword_col: str = "keyword") -> pd.DataFrame:
     grp = df.groupby(category_col).agg(
@@ -101,7 +100,7 @@ def export_xlsx(df_detail: pd.DataFrame, out_dir: Path, basename: str = "cluster
         df_detail.to_excel(writer, index=False, sheet_name="Detailed")
         summary = build_summary(df_detail)
         summary.to_excel(writer, index=False, sheet_name="Summary")
-        # Ajustement très simple des largeurs
+        # Ajustement largeurs simple
         for sheet_name, df in {"Detailed": df_detail, "Summary": summary}.items():
             ws = writer.sheets[sheet_name]
             for i, col in enumerate(df.columns, 1):
@@ -229,24 +228,23 @@ def categorize_batch(keywords: List[str], allowed_categories: List[str], lang: s
     return data["items"]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Interface Streamlit
+# Interface Streamlit (LISTE)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
     load_dotenv()
-
-    st.set_page_config(page_title="Amundi - Keyword Clustering (≤8 catégories)", page_icon="📊", layout="wide")
-    st.title("📊 Amundi — Clustering de mots-clés (≤ 8 catégories)")
-    st.caption("Streamlit + OpenAI (Structured Outputs). Export XLSX détaillé + synthèse.")
+    st.set_page_config(page_title="Amundi - Keyword Clustering (≤8 catégories)", page_icon="📋", layout="wide")
+    st.title("📋 Amundi — Clustering de mots-clés (≤ 8 catégories) — Saisie en liste")
+    st.caption("Collez vos mots-clés (1 par ligne), proposez/éditez ≤ 8 catégories, export XLSX.")
 
     with st.sidebar:
         st.header("🔧 Paramètres")
         model = st.selectbox("Modèle", ["gpt-4o-mini", "gpt-4o-2024-08-06"], index=0)
         lang = st.selectbox("Langue des mots-clés", ["fr", "en"], index=0)
         batch_size = st.slider("Taille des lots", min_value=25, max_value=250, value=120, step=5)
-        st.slider("Température (indicatif)", 0.0, 1.0, 0.2, 0.1, disabled=True)  # figé dans le code
+        st.slider("Température (indicatif)", 0.0, 1.0, 0.2, 0.1, disabled=True)
         st.divider()
-        st.write("🔑 **OPENAI_API_KEY**:")
+        st.write("🔑 **OPENAI_API_KEY** :")
         if os.getenv("OPENAI_API_KEY"):
             st.success("Clé détectée via l'environnement / .env")
         else:
@@ -255,30 +253,29 @@ def main():
                 os.environ["OPENAI_API_KEY"] = key_input
                 st.success("Clé chargée en mémoire (session).")
 
-    st.write("## 1) Import du fichier de mots-clés")
-    upl = st.file_uploader("Chargez un **CSV** ou **XLSX**", type=["csv", "xlsx"])
-
-    if upl is None:
-        st.info("Chargez un fichier pour commencer.")
-        return
-
-    # Lecture dataset
-    if upl.name.lower().endswith(".csv"):
-        df = pd.read_csv(upl)
-    else:
-        df = pd.read_excel(upl)
-    if df.empty:
-        st.error("Le fichier est vide.")
-        return
-
-    kw_col = auto_detect_keyword_column(df)
-    st.info(f"Colonne détectée : **{kw_col}**")
-    keywords_all = (
-        df[kw_col].dropna().astype(str).str.strip()
-        .replace("", pd.NA).dropna().drop_duplicates().tolist()
+    st.write("## 1) Collez vos mots-clés (1 par ligne)")
+    placeholder = "\n".join([
+        "fonds actions europe",
+        "amundi research inflation",
+        "opcvm durable esg",
+        "assurance vie unités de compte",
+        "obligations court terme",
+        "fonds monétaires",
+        "allocation multi-actifs",
+        "gestion passive etf",
+        "scpi rendement",
+        "plan épargne retraite entreprise",
+    ])
+    raw = st.text_area(
+        "Collez ici (copier/coller depuis Excel/Sheets fonctionne) — 1 mot-clé par ligne",
+        value=placeholder,
+        height=240
     )
+    keywords_all = parse_keyword_list(raw)
     st.write(f"Total de mots-clés uniques : **{len(keywords_all)}**")
-    st.dataframe(df.head(10))
+    if len(keywords_all) == 0:
+        st.info("Ajoutez au moins quelques mots-clés pour continuer.")
+        return
 
     st.write("## 2) Définition des catégories (max 8)")
     mode = st.radio("Choix du mode", ["Auto (proposées par l'IA)", "Manuel (je fournis la liste)"], index=0, horizontal=True)
